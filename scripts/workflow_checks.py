@@ -59,30 +59,38 @@ def make_y4m(
     frame_count: int = 5,
     rate_numerator: int = 12,
     rate_denominator: int = 1,
+    pixel_format: str = "C420jpeg",
 ) -> bytes:
     header = (
         "YUV4MPEG2 "
         f"W{width} H{height} "
         f"F{rate_numerator}:{rate_denominator} "
-        "Ip C420jpeg\n"
+        f"Ip {pixel_format}\n"
     ).encode("ascii")
+    ten_bit = pixel_format == "C420p10"
+    bytes_per_sample = 2 if ten_bit else 1
+    sample_limit = 1024 if ten_bit else 256
+
+    def encode_sample(value: int) -> bytes:
+        return (value % sample_limit).to_bytes(bytes_per_sample, "little")
+
     chroma_width = width // 2
     chroma_height = height // 2
     parts = [header]
     for frame_index in range(frame_count):
         parts.append(b"FRAME\n")
-        y_plane = bytes(
-            (x * 3 + y * 5 + frame_index * 11) % 256
+        y_plane = b"".join(
+            encode_sample(x * 3 + y * 5 + frame_index * 11)
             for y in range(height)
             for x in range(width)
         )
-        u_plane = bytes(
-            (96 + x * 2 + frame_index * 3) % 256
+        u_plane = b"".join(
+            encode_sample(96 + x * 2 + frame_index * 3)
             for _y in range(chroma_height)
             for x in range(chroma_width)
         )
-        v_plane = bytes(
-            (144 + y * 2 + frame_index * 5) % 256
+        v_plane = b"".join(
+            encode_sample(144 + y * 2 + frame_index * 5)
             for y in range(chroma_height)
             for _x in range(chroma_width)
         )
@@ -393,6 +401,243 @@ def run_verify_reproduction(
     }
 
 
+def _y4m_planes(data: bytes) -> dict[str, Any]:
+    """Decode a single-family Y4M payload into geometry and integer samples."""
+    from avprovenance.media.y4m import decode_y4m
+
+    clip = decode_y4m(data)
+    bytes_per_sample = clip.bytes_per_sample
+
+    def samples(plane: bytes) -> list[int]:
+        if bytes_per_sample == 1:
+            return list(plane)
+        return [
+            plane[index] | (plane[index + 1] << 8)
+            for index in range(0, len(plane), 2)
+        ]
+
+    frame = clip.frames[0]
+    return {
+        "clip": clip,
+        "width": clip.width,
+        "height": clip.height,
+        "chroma_width": clip.chroma_width,
+        "chroma_height": clip.chroma_height,
+        "bit_depth": clip.bit_depth,
+        "y": samples(frame.y_plane),
+        "u": samples(frame.u_plane),
+        "v": samples(frame.v_plane),
+    }
+
+
+def run_ten_bit_video_pipeline(
+    client: HTTPClient,
+    server: ProvenanceHTTPServer,
+) -> dict[str, Any]:
+    # ---- 10-bit ingest is proven by descriptor and by stored file content ----
+    source_bytes = make_y4m(
+        width=64,
+        height=36,
+        frame_count=6,
+        pixel_format="C420p10",
+    )
+    source = client.upload("ten-bit-source.y4m", source_bytes)
+    source_properties = source["descriptor"]["properties"]
+    require_equal(
+        source_properties["pixel_format"],
+        "C420p10",
+        "10-bit source pixel format",
+    )
+    require_equal(source_properties["bit_depth"], 10, "10-bit source bit depth")
+    stored_source = server.application._asset_bytes(
+        server.application.repository.get_asset(source["id"])
+    )
+    require_equal(stored_source, source_bytes, "10-bit source bytes preserved")
+
+    # ---- full crop / luma / mirror chain stays in a true 10-bit container ----
+    operations = [
+        {"type": "media_trim", "start_frame": 1, "frame_count": 4},
+        {
+            "type": "video_crop",
+            "x": 4,
+            "y": 4,
+            "width": 40,
+            "height": 20,
+        },
+        {"type": "video_luma_offset", "amount": 12},
+        {"type": "video_mirror"},
+    ]
+    rendition = client.create_rendition(
+        {
+            "primary_asset_id": source["id"],
+            "output_name": "ten-bit-derived.y4m",
+            "operations": operations,
+        }
+    )
+    require_equal(rendition["status"], "completed", "10-bit rendition status")
+    output_asset = rendition["output_asset"]
+    output_properties = output_asset["descriptor"]["properties"]
+    require_equal(
+        output_properties["pixel_format"],
+        "C420p10",
+        "10-bit output pixel format",
+    )
+    require_equal(output_properties["bit_depth"], 10, "10-bit output bit depth")
+    require_equal(output_properties["width"], 40, "10-bit output width")
+    require_equal(output_properties["height"], 20, "10-bit output height")
+
+    output_bytes = server.application._asset_bytes(
+        server.application.repository.get_asset(output_asset["id"])
+    )
+    # The on-disk derivative is genuinely 16-bit-per-sample C420p10, not an
+    # 8-bit stream wearing a new label.
+    parsed = _y4m_planes(output_bytes)
+    require_equal(parsed["bit_depth"], 10, "decoded output bit depth")
+    require(
+        all(0 <= sample <= 1023 for sample in parsed["y"]),
+        "10-bit luma samples stay inside the 10-bit range",
+    )
+    require(
+        all(0 <= sample <= 1023 for sample in parsed["u"] + parsed["v"]),
+        "10-bit chroma samples stay inside the 10-bit range",
+    )
+    require(
+        any(sample > 255 for sample in parsed["y"] + parsed["u"] + parsed["v"]),
+        "10-bit output carries values that an 8-bit container could not hold",
+    )
+
+    # ---- luma magnitude matches the 8-bit scale (x4) and never wraps ----
+    source_parsed = _y4m_planes(source_bytes)
+    luma_only = client.create_rendition(
+        {
+            "primary_asset_id": source["id"],
+            "output_name": "ten-bit-luma.y4m",
+            "operations": [{"type": "video_luma_offset", "amount": 12}],
+        }
+    )
+    luma_bytes = server.application._asset_bytes(
+        server.application.repository.get_asset(luma_only["output_asset"]["id"])
+    )
+    luma_parsed = _y4m_planes(luma_bytes)
+    for original, adjusted in zip(source_parsed["y"], luma_parsed["y"]):
+        require_equal(
+            adjusted,
+            max(0, min(1023, original + 48)),
+            "10-bit luma offset is scaled x4 and clamped without wrap",
+        )
+
+    # ---- mirror reverses samples, never the bytes inside a 16-bit slot ----
+    mirror_only = client.create_rendition(
+        {
+            "primary_asset_id": source["id"],
+            "output_name": "ten-bit-mirror.y4m",
+            "operations": [{"type": "video_mirror"}],
+        }
+    )
+    mirror_bytes = server.application._asset_bytes(
+        server.application.repository.get_asset(mirror_only["output_asset"]["id"])
+    )
+    mirror_parsed = _y4m_planes(mirror_bytes)
+    width = mirror_parsed["width"]
+    source_y = source_parsed["y"]
+    mirrored_y = mirror_parsed["y"]
+    for row in range(mirror_parsed["height"]):
+        source_row = source_y[row * width : (row + 1) * width]
+        mirrored_row = mirrored_y[row * width : (row + 1) * width]
+        require_equal(
+            mirrored_row,
+            source_row[::-1],
+            "10-bit horizontal mirror reverses whole samples",
+        )
+
+    # ---- integrity replay proves bit depth through bytes and descriptor ----
+    check_status, check = client.request(
+        "POST",
+        f"/v1/renditions/{rendition['id']}/integrity-checks",
+        {},
+    )
+    require_equal(check_status, 201, "10-bit integrity check status")
+    require_equal(check["status"], "verified", "10-bit integrity result")
+    require_equal(
+        check["reproduced_digest"],
+        output_asset["sha256"],
+        "10-bit replayed digest",
+    )
+    require_equal(
+        check["reproduced_descriptor"],
+        output_asset["descriptor"],
+        "10-bit replayed descriptor",
+    )
+
+    # ---- the generated derivative is itself a valid source that stays 10-bit ----
+    derived_asset = client.upload("ten-bit-derived-reingest.y4m", output_bytes)
+    require_equal(
+        derived_asset["descriptor"]["properties"]["bit_depth"],
+        10,
+        "re-ingested derivative bit depth",
+    )
+    second_rendition = client.create_rendition(
+        {
+            "primary_asset_id": derived_asset["id"],
+            "output_name": "ten-bit-derived-again.y4m",
+            "operations": [
+                {"type": "video_mirror"},
+                {"type": "video_luma_offset", "amount": -4},
+            ],
+        }
+    )
+    require_equal(
+        second_rendition["output_asset"]["descriptor"]["properties"]["bit_depth"],
+        10,
+        "second-generation 10-bit bit depth",
+    )
+    second_check_status, second_check = client.request(
+        "POST",
+        f"/v1/renditions/{second_rendition['id']}/integrity-checks",
+        {},
+    )
+    require_equal(
+        second_check_status,
+        201,
+        "second-generation integrity check status",
+    )
+    require_equal(
+        second_check["status"],
+        "verified",
+        "second-generation integrity result",
+    )
+
+    # ---- malformed 10-bit payloads (sample outside 10 bits) are rejected ----
+    malformed = bytearray(source_bytes)
+    # Flip a high container bit in the first luma sample's high byte.
+    frame_pos = malformed.index(b"FRAME\n") + len(b"FRAME\n")
+    malformed[frame_pos + 1] |= 0x04
+    bad_status, bad_body = client.request(
+        "POST",
+        "/v1/assets",
+        {
+            "filename": "bad-ten-bit.y4m",
+            "data_base64": base64.b64encode(bytes(malformed)).decode("ascii"),
+        },
+    )
+    require_equal(bad_status, 415, "malformed 10-bit ingest status")
+    require_equal(
+        bad_body["error"]["code"],
+        "UNSUPPORTED_MEDIA",
+        "malformed 10-bit ingest code",
+    )
+
+    return {
+        "workflow": "ten-bit-video-pipeline",
+        "source_asset_id": source["id"],
+        "rendition_id": rendition["id"],
+        "output_digest": output_asset["sha256"],
+        "bit_depth": output_properties["bit_depth"],
+        "integrity": check["status"],
+        "second_generation_integrity": second_check["status"],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -401,6 +646,7 @@ def main() -> int:
             "ingest-media-asset",
             "execute-rendition",
             "verify-reproduction",
+            "ten-bit-video-pipeline",
         ),
     )
     args = parser.parse_args()
@@ -410,6 +656,8 @@ def main() -> int:
             result = run_ingest_media_asset(client)
         elif args.workflow == "execute-rendition":
             result = run_execute_rendition(client)
+        elif args.workflow == "ten-bit-video-pipeline":
+            result = run_ten_bit_video_pipeline(client, server)
         else:
             result = run_verify_reproduction(client, server)
     print(json.dumps(result, sort_keys=True))

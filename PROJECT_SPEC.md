@@ -30,8 +30,10 @@ result.
 - Persistence: JSON state plus content-addressed binary files below one data
   directory
 - Public boundary: HTTP/JSON
-- Input media: PCM WAV and planar YUV4MPEG2 in the `C420` family
-- Output media: PCM WAV and planar YUV4MPEG2 in the `C420` family
+- Input media: PCM WAV and planar YUV4MPEG2 in the `C420` family (8-bit) and
+  `C420p10` (10-bit samples in little-endian 16-bit containers)
+- Output media: PCM WAV and planar YUV4MPEG2 in the same `C420` family and
+  storage width as the video source
 
 ## Core entities
 
@@ -205,6 +207,21 @@ Video plans:
 - `video_luma_offset`: `amount`
 - `video_mirror`: no additional parameters
 
+Video bit-depth rules:
+
+- `C420p10` stores each Y/U/V sample as a 10-bit value in a little-endian
+  16-bit slot. Geometry, crop, and mirror operate on samples, never on the
+  bytes inside a slot, so chroma sample locations stay aligned.
+- `video_luma_offset.amount` is authored on the historical 8-bit luma scale.
+  On 10-bit media it is rescaled by four so the visual magnitude matches the
+  8-bit operation, and results are clamped to the sample range instead of
+  wrapping.
+- A derived video keeps the source pixel format and bit depth. Feeding a
+  generated derivative back as a source preserves the same interpretation.
+- 8-bit inputs, plans, descriptors, and stored bytes keep their historical
+  byte-level results; the descriptor gains an explicit `bit_depth` property
+  only for the wider 10-bit container.
+
 All numeric bounds are validated before state is queued. Processing functions
 also re-check data-dependent constraints so malformed persisted plans cannot
 turn into partial output.
@@ -267,6 +284,7 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py ten-bit-video-pipeline
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in

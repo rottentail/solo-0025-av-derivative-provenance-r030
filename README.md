@@ -11,9 +11,15 @@ FFmpeg, network access, credentials, or an online database.
 ## What it does
 
 - Ingests one- or two-channel signed 16-bit PCM WAV.
-- Ingests planar 4:2:0 YUV4MPEG2 in the `C420` family.
+- Ingests planar 4:2:0 YUV4MPEG2 in the 8-bit `C420` family and in
+  `C420p10`, where each sample is a 10-bit value held in a little-endian
+  16-bit container.
 - Applies audio trim, gain, normalization, and two-source mixing.
 - Applies video trim, even-aligned crop, luma offset, and horizontal mirror.
+  10-bit operations work on whole samples: crop and mirror preserve chroma
+  sample locations, and luma offsets are scaled to the 8-bit visual amplitude
+  and clamped instead of wrapping. Derivatives keep the source bit depth, and
+  re-ingesting a derivative preserves the same interpretation.
 - Persists immutable assets, rendition state, provenance edges, and integrity
   checks.
 - Replays the stored operation plan and compares both bytes and media
@@ -196,6 +202,7 @@ current production workflow checks are:
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py ten-bit-video-pipeline
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,

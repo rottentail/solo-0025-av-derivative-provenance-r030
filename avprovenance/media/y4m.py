@@ -1,4 +1,15 @@
-"""Planar YUV4MPEG2 parsing and serialization for bounded C420 media."""
+"""Planar YUV4MPEG2 parsing and serialization for bounded C420 media.
+
+Two storage widths share the same 4:2:0 planar geometry:
+
+- the 8-bit C420 family, where one byte carries one sample, and
+- C420p10, where every Y/U/V sample is a 10-bit value stored in a
+  little-endian 16-bit container (two bytes per sample).
+
+Frames always keep their raw plane bytes. The clip-level ``bit_depth`` and
+``bytes_per_sample`` values are the single source of truth used by every
+plane operation, so 10-bit samples are never treated as independent bytes.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +19,17 @@ from ..errors import UnsupportedMedia
 from ..models import MediaDescriptor
 
 
-SUPPORTED_PIXEL_FORMATS = {"C420", "C420jpeg", "C420mpeg2", "C420p"}
+PIXEL_FORMAT_BIT_DEPTHS = {
+    "C420": 8,
+    "C420jpeg": 8,
+    "C420mpeg2": 8,
+    "C420p": 8,
+    "C420p10": 10,
+}
+SUPPORTED_PIXEL_FORMATS = frozenset(PIXEL_FORMAT_BIT_DEPTHS)
+
+# 10-bit samples live in the low ten bits of a little-endian 16-bit slot.
+TEN_BIT_MAX_SAMPLE = (1 << 10) - 1
 
 
 @dataclass(frozen=True)
@@ -27,6 +48,7 @@ class Y4mClip:
     interlace: str
     pixel_format: str
     frames: tuple[Y4mFrame, ...]
+    bit_depth: int = 8
 
     @property
     def frame_count(self) -> int:
@@ -39,6 +61,14 @@ class Y4mClip:
     @property
     def chroma_height(self) -> int:
         return self.height // 2
+
+    @property
+    def bytes_per_sample(self) -> int:
+        return 2 if self.bit_depth == 10 else 1
+
+    @property
+    def max_sample_value(self) -> int:
+        return (1 << self.bit_depth) - 1
 
 
 def _read_line(data: bytes, position: int) -> tuple[str, int]:
@@ -113,6 +143,18 @@ def _validate_header(values: dict[str, str | int]) -> None:
         )
 
 
+def _validate_ten_bit_plane(plane: bytes, label: str) -> None:
+    # A 16-bit little-endian sample cannot encode a valid 10-bit value when
+    # any of its six high container bits is set. Scanning the high bytes only
+    # (every second byte) keeps the check linear in the plane size.
+    for high_byte in plane[1::2]:
+        if high_byte > (TEN_BIT_MAX_SAMPLE >> 8):
+            raise UnsupportedMedia(
+                "A C420p10 sample exceeds the 10-bit range.",
+                details={"plane": label, "max_sample": TEN_BIT_MAX_SAMPLE},
+            )
+
+
 def decode_y4m(data: bytes) -> Y4mClip:
     if not data.startswith(b"YUV4MPEG2"):
         raise UnsupportedMedia("The payload is not a Y4M stream.")
@@ -125,10 +167,13 @@ def decode_y4m(data: bytes) -> Y4mClip:
 
     width = int(header["width"])
     height = int(header["height"])
+    pixel_format = str(header["pixel_format"])
+    bit_depth = PIXEL_FORMAT_BIT_DEPTHS[pixel_format]
+    bytes_per_sample = 2 if bit_depth == 10 else 1
     chroma_width = width // 2
     chroma_height = height // 2
-    y_size = width * height
-    chroma_size = chroma_width * chroma_height
+    y_size = width * height * bytes_per_sample
+    chroma_size = chroma_width * chroma_height * bytes_per_sample
     frames: list[Y4mFrame] = []
 
     while position < len(data):
@@ -141,11 +186,18 @@ def decode_y4m(data: bytes) -> Y4mClip:
             raise UnsupportedMedia("A Y4M frame payload is truncated.")
         y_end = position + y_size
         u_end = y_end + chroma_size
+        y_plane = data[position:y_end]
+        u_plane = data[y_end:u_end]
+        v_plane = data[u_end:end]
+        if bit_depth == 10:
+            _validate_ten_bit_plane(y_plane, "y")
+            _validate_ten_bit_plane(u_plane, "u")
+            _validate_ten_bit_plane(v_plane, "v")
         frames.append(
             Y4mFrame(
-                y_plane=data[position:y_end],
-                u_plane=data[y_end:u_end],
-                v_plane=data[u_end:end],
+                y_plane=y_plane,
+                u_plane=u_plane,
+                v_plane=v_plane,
             )
         )
         position = end
@@ -160,32 +212,39 @@ def decode_y4m(data: bytes) -> Y4mClip:
         rate_numerator=int(header["rate_numerator"]),
         rate_denominator=int(header["rate_denominator"]),
         interlace=str(header["interlace"]),
-        pixel_format=str(header["pixel_format"]),
+        pixel_format=pixel_format,
         frames=tuple(frames),
+        bit_depth=bit_depth,
     )
 
 
 def inspect_y4m(data: bytes) -> MediaDescriptor:
     clip = decode_y4m(data)
+    properties: dict[str, object] = {
+        "width": clip.width,
+        "height": clip.height,
+        "frame_count": clip.frame_count,
+        "rate_numerator": clip.rate_numerator,
+        "rate_denominator": clip.rate_denominator,
+        "interlace": clip.interlace,
+        "pixel_format": clip.pixel_format,
+        "duration_seconds": round(
+            clip.frame_count
+            * clip.rate_denominator
+            / clip.rate_numerator,
+            9,
+        ),
+    }
+    # The 8-bit descriptor keeps its historical shape so existing assets and
+    # recorded integrity replays remain byte-identical. The wider container is
+    # additionally surfaced as an explicit bit depth.
+    if clip.bit_depth != 8:
+        properties["bit_depth"] = clip.bit_depth
     return MediaDescriptor(
         kind="video",
         mime_type="video/x-yuv4mpeg2",
         container="y4m",
-        properties={
-            "width": clip.width,
-            "height": clip.height,
-            "frame_count": clip.frame_count,
-            "rate_numerator": clip.rate_numerator,
-            "rate_denominator": clip.rate_denominator,
-            "interlace": clip.interlace,
-            "pixel_format": clip.pixel_format,
-            "duration_seconds": round(
-                clip.frame_count
-                * clip.rate_denominator
-                / clip.rate_numerator,
-                9,
-            ),
-        },
+        properties=properties,
     )
 
 
